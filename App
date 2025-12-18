@@ -1,0 +1,704 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { AppStage, ASL_ITEMS, COLOR_LEVELS, COLORS, AslChallenge } from './types';
+import Button from './components/Button';
+import CameraCapture, { CameraHandle } from './components/CameraCapture';
+import { validateAslSign, generateStory, validateStoryAnswer, StoryData } from './services/geminiService';
+
+// --- STAGE COMPONENTS ---
+
+// 1. Memory Stage
+const MemoryStage: React.FC<{ 
+  sequence: string; 
+  onComplete: () => void 
+}> = ({ sequence, onComplete }) => {
+  return (
+    <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-8 text-center animate-fade-in">
+      <h2 className="text-3xl font-bold text-slate-800">Memory Test</h2>
+      <div className="bg-white p-8 rounded-2xl shadow-xl border-2 border-blue-100 max-w-md w-full">
+        <p className="text-lg text-slate-600 mb-6 font-medium">
+          Please memorize this 4-digit sequence. You will need to recall it at the end of the test.
+        </p>
+        <div className="text-6xl font-mono font-black tracking-widest text-blue-600 my-8">
+          {sequence.split('').join(' ')}
+        </div>
+      </div>
+      <Button onClick={onComplete} size="lg">
+        I have memorized it
+      </Button>
+    </div>
+  );
+};
+
+// 2. Object Naming Stage
+const ObjectNamingStage: React.FC<{ 
+  onComplete: (score: number) => void 
+}> = ({ onComplete }) => {
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [score, setScore] = useState(0);
+  const [shuffledItems, setShuffledItems] = useState<AslChallenge[]>([]);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [feedback, setFeedback] = useState<{correct: boolean, msg: string} | null>(null);
+  const [attempts, setAttempts] = useState(0);
+  const cameraRef = useRef<CameraHandle>(null);
+  const timerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    // Shuffle items on mount
+    setShuffledItems([...ASL_ITEMS].sort(() => 0.5 - Math.random()));
+    
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, []);
+
+  const advanceToNext = (wasCorrect: boolean) => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+
+    const newScore = wasCorrect ? score + 1 : score;
+    setScore(newScore);
+
+    if (currentIndex < shuffledItems.length - 1) {
+      setFeedback(null);
+      setAttempts(0);
+      setIsProcessing(false);
+      setCurrentIndex(prev => prev + 1);
+    } else {
+      // Finished
+      onComplete(newScore);
+    }
+  };
+
+  const handleCapture = async () => {
+    if (!cameraRef.current) return;
+    
+    setIsProcessing(true);
+    setFeedback(null);
+    
+    const imageSrc = cameraRef.current.capture();
+    if (!imageSrc) {
+      setIsProcessing(false);
+      return;
+    }
+
+    const currentItem = shuffledItems[currentIndex];
+    
+    const nextAttemptCount = attempts + 1;
+    setAttempts(nextAttemptCount);
+    
+    // Call Gemini API
+    const result = await validateAslSign(imageSrc, currentItem.word);
+    
+    setIsProcessing(false);
+
+    if (result.correct) {
+      setFeedback({ correct: true, msg: "Correct! " + result.reasoning });
+      // Auto advance after delay
+      timerRef.current = window.setTimeout(() => {
+        advanceToNext(true);
+      }, 3000);
+    } else {
+      if (nextAttemptCount >= 2) {
+         // Failed twice
+         setFeedback({ correct: false, msg: "Incorrect. " + result.reasoning + " Moving to next item." });
+         // Auto advance after delay
+         timerRef.current = window.setTimeout(() => {
+            advanceToNext(false);
+         }, 3000);
+      } else {
+         // Can try again
+         setFeedback({ correct: false, msg: "Incorrect. " + result.reasoning + " Try again." });
+      }
+    }
+  };
+
+  const handleManualSkipOrNext = () => {
+    // If feedback is showing correct, treat manual click as correct advance
+    // Otherwise treat as skip (incorrect)
+    const isSuccess = feedback?.correct === true;
+    advanceToNext(isSuccess);
+  };
+
+  if (shuffledItems.length === 0) return <div>Loading...</div>;
+
+  const currentItem = shuffledItems[currentIndex];
+  const isFinished = currentIndex >= shuffledItems.length;
+
+  if (isFinished) return null;
+  
+  const attemptDisplayNumber = feedback?.correct 
+    ? attempts 
+    : Math.min(attempts + 1, 2);
+
+  return (
+    <div className="max-w-4xl mx-auto w-full px-4 animate-fade-in">
+      <div className="flex justify-between items-center mb-6">
+        <h2 className="text-2xl font-bold text-slate-800">Object Naming (ASL)</h2>
+        <div className="flex gap-2">
+            <span className="text-sm font-semibold text-slate-500 bg-slate-100 px-3 py-1 rounded-full">
+            Item {currentIndex + 1} / {shuffledItems.length}
+            </span>
+            <span className={`text-sm font-semibold px-3 py-1 rounded-full ${attempts === 1 && !feedback?.correct ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-500'}`}>
+            Attempt {attemptDisplayNumber} / 2
+            </span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div className="flex flex-col items-center justify-center bg-white rounded-2xl shadow-lg border-2 border-slate-200 p-8 min-h-[300px]">
+          <div className="text-slate-400 text-sm font-medium mb-4 uppercase tracking-wider">Target Object</div>
+          <div className="text-[150px] leading-none filter grayscale contrast-200 brightness-50 select-none">
+            {currentItem.emoji}
+          </div>
+          <p className="mt-8 text-slate-500 text-center text-sm italic">
+            Describe this object using ASL
+          </p>
+        </div>
+
+        <div className="flex flex-col space-y-4">
+          <CameraCapture ref={cameraRef} className="aspect-[4/3] w-full bg-black rounded-2xl border-4 border-slate-800" />
+          
+          <div className="flex flex-col space-y-2">
+            {feedback && (
+              <div className={`p-4 rounded-lg text-sm font-medium border ${feedback.correct ? 'bg-green-50 border-green-200 text-green-800' : 'bg-red-50 border-red-200 text-red-800'}`}>
+                {feedback.msg}
+              </div>
+            )}
+            
+            <div className="flex gap-3">
+               {!feedback?.correct && (
+                 <Button 
+                   onClick={handleCapture} 
+                   isLoading={isProcessing} 
+                   className="flex-1"
+                   size="lg"
+                   disabled={attempts >= 2}
+                 >
+                   {attempts >= 1 ? "Final Attempt" : "Check Answer"}
+                 </Button>
+               )}
+               
+               <Button 
+                 onClick={handleManualSkipOrNext} 
+                 variant="secondary" 
+                 disabled={isProcessing && !feedback} 
+                 className="flex-none"
+               >
+                 {feedback?.correct ? 'Next Item' : 'Skip'}
+               </Button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// 3. Story Recall Stage
+const StoryRecallStage: React.FC<{
+  onComplete: (score: number) => void
+}> = ({ onComplete }) => {
+  const [phase, setPhase] = useState<'LOADING' | 'READING' | 'ANSWERING'>('LOADING');
+  const [story, setStory] = useState<StoryData | null>(null);
+  const [currentQIndex, setCurrentQIndex] = useState(0);
+  const [score, setScore] = useState(0);
+  const [attempts, setAttempts] = useState(0);
+  const [feedback, setFeedback] = useState<{correct: boolean, msg: string} | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const cameraRef = useRef<CameraHandle>(null);
+  const timerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const fetchStory = async () => {
+      const data = await generateStory();
+      setStory(data);
+      setPhase('READING');
+    };
+    fetchStory();
+  }, []);
+
+  const handleStartQuestions = () => {
+    setPhase('ANSWERING');
+  };
+
+  const advanceToNext = (wasCorrect: boolean) => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+
+    const newScore = wasCorrect ? score + 1 : score;
+    setScore(newScore);
+
+    if (story && currentQIndex < story.questions.length - 1) {
+      setFeedback(null);
+      setAttempts(0);
+      setIsProcessing(false);
+      setCurrentQIndex(prev => prev + 1);
+    } else {
+      onComplete(newScore);
+    }
+  };
+
+  const handleCapture = async () => {
+    if (!cameraRef.current || !story) return;
+    
+    setIsProcessing(true);
+    setFeedback(null);
+    
+    const imageSrc = cameraRef.current.capture();
+    if (!imageSrc) {
+      setIsProcessing(false);
+      return;
+    }
+
+    const currentQuestion = story.questions[currentQIndex];
+    const nextAttemptCount = attempts + 1;
+    setAttempts(nextAttemptCount);
+    
+    const result = await validateStoryAnswer(imageSrc, currentQuestion.question, currentQuestion.answer);
+    
+    setIsProcessing(false);
+
+    if (result.correct) {
+      setFeedback({ correct: true, msg: "Correct! " + result.reasoning });
+      timerRef.current = window.setTimeout(() => {
+        advanceToNext(true);
+      }, 2000);
+    } else {
+      if (nextAttemptCount >= 2) {
+         setFeedback({ correct: false, msg: "Incorrect. " + result.reasoning + " Moving to next question." });
+         timerRef.current = window.setTimeout(() => {
+            advanceToNext(false);
+         }, 3000);
+      } else {
+         setFeedback({ correct: false, msg: "Incorrect. " + result.reasoning + " Try again." });
+      }
+    }
+  };
+
+  const handleManualSkipOrNext = () => {
+    const isSuccess = feedback?.correct === true;
+    advanceToNext(isSuccess);
+  };
+
+  if (phase === 'LOADING' || !story) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[50vh] animate-fade-in space-y-4">
+         <div className="w-12 h-12 border-4 border-blue-200 border-t-blue-600 rounded-full animate-spin"></div>
+         <p className="text-lg text-slate-600 font-medium">Generating Story...</p>
+      </div>
+    );
+  }
+
+  if (phase === 'READING') {
+    return (
+      <div className="max-w-2xl mx-auto flex flex-col items-center justify-center min-h-[60vh] space-y-8 animate-fade-in px-4">
+        <h2 className="text-3xl font-bold text-slate-800">Story Memory</h2>
+        <div className="bg-white p-8 rounded-2xl shadow-xl border-2 border-indigo-100 w-full">
+          <p className="text-xl md:text-2xl text-slate-800 leading-relaxed font-medium">
+            {story.storyText}
+          </p>
+        </div>
+        <p className="text-slate-500 italic">Read carefully. You will be asked questions about this story.</p>
+        <Button onClick={handleStartQuestions} size="lg">
+          I have read it
+        </Button>
+      </div>
+    );
+  }
+
+  const currentQ = story.questions[currentQIndex];
+  const attemptDisplayNumber = feedback?.correct ? attempts : Math.min(attempts + 1, 2);
+
+  return (
+    <div className="max-w-4xl mx-auto w-full px-4 animate-fade-in">
+       <div className="flex justify-between items-center mb-6">
+        <h2 className="text-2xl font-bold text-slate-800">Story Recall</h2>
+        <div className="flex gap-2">
+            <span className="text-sm font-semibold text-slate-500 bg-slate-100 px-3 py-1 rounded-full">
+            Question {currentQIndex + 1} / {story.questions.length}
+            </span>
+            <span className={`text-sm font-semibold px-3 py-1 rounded-full ${attempts === 1 && !feedback?.correct ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-500'}`}>
+            Attempt {attemptDisplayNumber} / 2
+            </span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div className="flex flex-col items-center justify-center bg-white rounded-2xl shadow-lg border-2 border-indigo-100 p-8 min-h-[300px]">
+          <h3 className="text-indigo-600 text-sm font-bold uppercase tracking-wider mb-6">Question</h3>
+          <p className="text-2xl md:text-3xl font-bold text-slate-800 text-center leading-tight">
+            {currentQ.question}
+          </p>
+          <p className="mt-8 text-slate-400 text-sm font-medium">Answer using ASL</p>
+        </div>
+
+        <div className="flex flex-col space-y-4">
+          <CameraCapture ref={cameraRef} className="aspect-[4/3] w-full bg-black rounded-2xl border-4 border-slate-800" />
+          
+          <div className="flex flex-col space-y-2">
+            {feedback && (
+              <div className={`p-4 rounded-lg text-sm font-medium border ${feedback.correct ? 'bg-green-50 border-green-200 text-green-800' : 'bg-red-50 border-red-200 text-red-800'}`}>
+                {feedback.msg}
+              </div>
+            )}
+            
+            <div className="flex gap-3">
+               {!feedback?.correct && (
+                 <Button 
+                   onClick={handleCapture} 
+                   isLoading={isProcessing} 
+                   className="flex-1"
+                   size="lg"
+                   disabled={attempts >= 2}
+                 >
+                   {attempts >= 1 ? "Final Attempt" : "Check Answer"}
+                 </Button>
+               )}
+               
+               <Button 
+                 onClick={handleManualSkipOrNext} 
+                 variant="secondary" 
+                 disabled={isProcessing && !feedback} 
+                 className="flex-none"
+               >
+                 {feedback?.correct ? 'Next Question' : 'Skip'}
+               </Button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// 4. Color Test Stage (Stroop-like)
+const ColorTestStage: React.FC<{ 
+  onComplete: (score: number) => void 
+}> = ({ onComplete }) => {
+  const [levelIndex, setLevelIndex] = useState(0);
+  const [score, setScore] = useState(0);
+  const [options, setOptions] = useState<{color: string, id: number}[]>([]);
+  const [introSeen, setIntroSeen] = useState(false);
+
+  const targetColorName = COLOR_LEVELS[levelIndex];
+
+  // Generate options for the current level
+  useEffect(() => {
+    if (levelIndex >= COLOR_LEVELS.length) {
+      onComplete(score);
+      return;
+    }
+
+    // We need 4 options. One MUST be the target color.
+    // The visual word is always the target name (e.g. "BLUE").
+    // The prompt says: "show users the word BLUE written in four different colors."
+    // "The user needs to click on the one that is blue."
+    
+    const correctColorHex = COLORS[targetColorName];
+    const otherColorKeys = Object.keys(COLORS).filter(k => k !== targetColorName);
+    
+    // Pick 3 random wrong colors
+    const wrongColors = otherColorKeys.sort(() => 0.5 - Math.random()).slice(0, 3).map(k => COLORS[k]);
+    
+    const currentOptions = [correctColorHex, ...wrongColors]
+      .sort(() => 0.5 - Math.random())
+      .map((hex, idx) => ({ color: hex, id: idx }));
+
+    setOptions(currentOptions);
+  }, [levelIndex, targetColorName]);
+
+  const handleOptionClick = (hexColor: string) => {
+    const correctHex = COLORS[targetColorName];
+    if (hexColor === correctHex) {
+      setScore(s => s + 1);
+    }
+    // Advance regardless of correct/incorrect
+    setLevelIndex(prev => prev + 1);
+  };
+
+  if (!introSeen) {
+    return (
+      <div className="max-w-xl mx-auto text-center space-y-8 animate-fade-in">
+        <h2 className="text-3xl font-bold text-slate-800">Color Recognition</h2>
+        <div className="bg-blue-50 p-6 rounded-xl border border-blue-200">
+          <p className="text-lg text-slate-700">
+            In this next section, you will see the word <span className="font-bold text-blue-600">BLUE</span> written in four different colors.
+          </p>
+          <p className="mt-4 text-lg font-bold text-slate-800">
+            Click on the word that is colored BLUE.
+          </p>
+        </div>
+        <Button onClick={() => setIntroSeen(true)} size="lg">Start Color Test</Button>
+      </div>
+    );
+  }
+
+  if (levelIndex >= COLOR_LEVELS.length) return null;
+
+  return (
+    <div className="max-w-2xl mx-auto flex flex-col items-center justify-center min-h-[50vh] animate-fade-in">
+      <div className="mb-8 text-center">
+        <h3 className="text-xl text-slate-500 font-medium mb-2">Find the word colored:</h3>
+        <h2 className="text-4xl font-black text-slate-800 tracking-wider">{targetColorName}</h2>
+      </div>
+      
+      <div className="grid grid-cols-2 gap-6 w-full">
+        {options.map((opt) => (
+          <button
+            key={opt.id}
+            onClick={() => handleOptionClick(opt.color)}
+            className="h-32 rounded-xl bg-white shadow-md border-2 border-slate-100 hover:border-slate-300 hover:shadow-lg transition-all flex items-center justify-center"
+          >
+            <span 
+              className="text-4xl font-black tracking-widest" 
+              style={{ color: opt.color }}
+            >
+              {targetColorName}
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// 5. Recall Stage
+const RecallStage: React.FC<{ 
+  originalSequence: string; 
+  onComplete: (correctDigits: number) => void 
+}> = ({ originalSequence, onComplete }) => {
+  const [input, setInput] = useState('');
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    let correctCount = 0;
+    // Simple digit matching count
+    const cleanInput = input.replace(/\D/g, '').slice(0, 4);
+    const cleanOriginal = originalSequence;
+    
+    for (let i = 0; i < 4; i++) {
+        if (cleanInput[i] === cleanOriginal[i]) {
+            correctCount++;
+        }
+    }
+    onComplete(correctCount);
+  };
+
+  return (
+    <div className="flex flex-col items-center justify-center min-h-[50vh] max-w-md mx-auto animate-fade-in">
+      <h2 className="text-3xl font-bold text-slate-800 mb-8">Final Recall</h2>
+      <p className="text-lg text-slate-600 mb-6 text-center">
+        Enter the 4-digit number sequence shown at the beginning of the test.
+      </p>
+      
+      <form onSubmit={handleSubmit} className="w-full space-y-6">
+        <input
+          type="text" // using text to prevent spinners
+          inputMode="numeric"
+          pattern="[0-9]*"
+          maxLength={4}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="0 0 0 0"
+          className="w-full text-center text-4xl font-mono p-4 rounded-xl border-2 border-slate-300 focus:border-blue-500 focus:ring focus:ring-blue-200 outline-none transition-all placeholder:text-slate-200 tracking-widest"
+          autoFocus
+        />
+        <Button type="submit" size="lg" className="w-full" disabled={input.length === 0}>
+          Submit
+        </Button>
+      </form>
+    </div>
+  );
+};
+
+// 6. Results Stage
+const ResultsStage: React.FC<{ 
+  score: { memory: number, object: number, color: number, story: number };
+  maxScore: { memory: number, object: number, color: number, story: number };
+}> = ({ score, maxScore }) => {
+  
+  const totalScore = score.memory + score.object + score.color + score.story;
+  const totalMax = maxScore.memory + maxScore.object + maxScore.color + maxScore.story;
+  const percentage = Math.round((totalScore / totalMax) * 100);
+  const passed = percentage >= 85;
+
+  return (
+    <div className="max-w-2xl mx-auto bg-white rounded-3xl shadow-xl overflow-hidden border border-slate-100 animate-fade-in my-8">
+      <div className={`p-8 text-center ${passed ? 'bg-green-600' : 'bg-amber-500'} text-white`}>
+        <h2 className="text-4xl font-bold mb-2">Test Complete</h2>
+        <div className="text-7xl font-black my-4">{percentage}%</div>
+        <p className="text-white/90 font-medium text-lg">Overall Accuracy</p>
+      </div>
+
+      <div className="p-8 space-y-8">
+        <div className="space-y-4">
+          <h3 className="text-xl font-bold text-slate-800 border-b pb-2">Breakdown</h3>
+          <div className="flex justify-between items-center text-slate-600">
+             <span>Object Naming (ASL)</span>
+             <span className="font-mono font-bold">{score.object} / {maxScore.object}</span>
+          </div>
+          <div className="flex justify-between items-center text-slate-600">
+             <span>Story Recall (ASL)</span>
+             <span className="font-mono font-bold">{score.story} / {maxScore.story}</span>
+          </div>
+          <div className="flex justify-between items-center text-slate-600">
+             <span>Color Recognition</span>
+             <span className="font-mono font-bold">{score.color} / {maxScore.color}</span>
+          </div>
+          <div className="flex justify-between items-center text-slate-600">
+             <span>Digit Recall</span>
+             <span className="font-mono font-bold">{score.memory} / {maxScore.memory}</span>
+          </div>
+        </div>
+
+        <div className={`rounded-xl p-6 ${passed ? 'bg-green-50 border-2 border-green-100' : 'bg-red-50 border-2 border-red-100'}`}>
+          <h4 className={`text-lg font-bold mb-2 ${passed ? 'text-green-800' : 'text-red-800'}`}>
+            {passed ? "Assessment: Normal Range" : "Recommendation"}
+          </h4>
+          <p className={`${passed ? 'text-green-700' : 'text-red-700'} leading-relaxed`}>
+            {passed 
+              ? "Your score is within the normal range. Continue to maintain a healthy lifestyle."
+              : "Your accuracy is below 85%. We recommend following up with your medical provider for an official Alzheimer's screening test."
+            }
+          </p>
+        </div>
+        
+        <div className="text-center pt-4">
+            <Button onClick={() => window.location.reload()} variant="outline">Start Over</Button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+
+// --- MAIN APP ---
+
+const App: React.FC = () => {
+  const [stage, setStage] = useState<AppStage>(AppStage.INTRO);
+  const [sequence, setSequence] = useState('');
+  
+  // Scores
+  const [objectScore, setObjectScore] = useState(0);
+  const [colorScore, setColorScore] = useState(0);
+  const [memoryScore, setMemoryScore] = useState(0);
+  const [storyScore, setStoryScore] = useState(0);
+
+  // Constants for scoring
+  const MAX_SCORES = {
+    memory: 4, // 1 point per digit
+    object: ASL_ITEMS.length,
+    color: COLOR_LEVELS.length,
+    story: 2 // 2 questions
+  };
+
+  useEffect(() => {
+    // Generate sequence on mount
+    const seq = Array.from({length: 4}, () => Math.floor(Math.random() * 10)).join('');
+    setSequence(seq);
+  }, []);
+
+  const startTest = () => setStage(AppStage.MEMORY_PRESENTATION);
+  const finishMemory = () => setStage(AppStage.OBJECT_NAMING);
+  
+  const finishObjectNaming = (score: number) => {
+    setObjectScore(score);
+    setStage(AppStage.STORY_RECALL);
+  };
+
+  const finishStoryRecall = (score: number) => {
+    setStoryScore(score);
+    setStage(AppStage.COLOR_TEST);
+  };
+  
+  const finishColorTest = (score: number) => {
+    setColorScore(score);
+    setStage(AppStage.RECALL);
+  };
+  
+  const finishRecall = (score: number) => {
+    setMemoryScore(score);
+    setStage(AppStage.RESULTS);
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 font-sans selection:bg-blue-100">
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-10">
+        <div className="max-w-5xl mx-auto px-4 h-16 flex items-center justify-between">
+          <div className="flex items-center space-x-2">
+            <span className="text-2xl">🧠</span>
+            <h1 className="text-xl font-bold text-slate-800 tracking-tight">NeuroSign Screen</h1>
+          </div>
+          <div className="text-sm font-medium text-slate-500">
+             {stage !== AppStage.INTRO && stage !== AppStage.RESULTS && "Screening in Progress"}
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-5xl mx-auto px-4 py-8 md:py-12">
+        {stage === AppStage.INTRO && (
+          <div className="max-w-2xl mx-auto text-center space-y-8 animate-fade-in mt-12">
+            <h1 className="text-4xl md:text-5xl font-black text-slate-900 leading-tight">
+              Cognitive Screening for the Deaf Community
+            </h1>
+            <p className="text-xl text-slate-600 leading-relaxed">
+              This application uses computer vision to detect ASL signs and assesses memory and cognitive function.
+            </p>
+            
+            <div className="bg-blue-50 p-6 rounded-2xl text-left border border-blue-100 shadow-sm">
+                <h3 className="font-bold text-blue-900 mb-3 uppercase text-sm tracking-wider">Test Overview</h3>
+                <ul className="space-y-3 text-blue-800">
+                    <li className="flex items-start"><span className="mr-2">1.</span> <span><strong>Memory:</strong> Remember a 4-digit sequence.</span></li>
+                    <li className="flex items-start"><span className="mr-2">2.</span> <span><strong>Object Naming:</strong> Sign the names of objects shown on screen.</span></li>
+                    <li className="flex items-start"><span className="mr-2">3.</span> <span><strong>Story Recall:</strong> Read a short story and answer questions in ASL.</span></li>
+                    <li className="flex items-start"><span className="mr-2">4.</span> <span><strong>Color Recognition:</strong> Identify colors correctly.</span></li>
+                    <li className="flex items-start"><span className="mr-2">5.</span> <span><strong>Recall:</strong> Enter the original number sequence.</span></li>
+                </ul>
+            </div>
+            
+            <p className="text-sm text-slate-500 bg-white p-4 rounded-lg border border-slate-200">
+               ⚠️ This app requires camera access. No video data is stored; all processing is done in real-time.
+            </p>
+
+            <Button onClick={startTest} size="lg" className="w-full sm:w-auto shadow-lg shadow-blue-500/30">
+              Start Screening
+            </Button>
+          </div>
+        )}
+
+        {stage === AppStage.MEMORY_PRESENTATION && (
+          <MemoryStage sequence={sequence} onComplete={finishMemory} />
+        )}
+
+        {stage === AppStage.OBJECT_NAMING && (
+          <ObjectNamingStage onComplete={finishObjectNaming} />
+        )}
+
+        {stage === AppStage.STORY_RECALL && (
+          <StoryRecallStage onComplete={finishStoryRecall} />
+        )}
+
+        {stage === AppStage.COLOR_TEST && (
+          <ColorTestStage onComplete={finishColorTest} />
+        )}
+
+        {stage === AppStage.RECALL && (
+          <RecallStage originalSequence={sequence} onComplete={finishRecall} />
+        )}
+
+        {stage === AppStage.RESULTS && (
+          <ResultsStage 
+            score={{ memory: memoryScore, object: objectScore, color: colorScore, story: storyScore }} 
+            maxScore={MAX_SCORES} 
+          />
+        )}
+      </main>
+    </div>
+  );
+};
+
+export default App;
